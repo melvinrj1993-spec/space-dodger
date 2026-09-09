@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Space Dodger V1.2</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#020307;color:#e7edf2;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.wrap{width:min(94vw,520px);margin:0 auto;padding:12px}.hud{display:flex;justify-content:space-between;font-size:12px;padding:8px 2px}
+.screen{position:relative}.screen canvas{display:block;width:100%;height:auto;background:#020307;border:1px solid #29303a;border-radius:12px;touch-action:none;image-rendering:pixelated}
+.overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;background:rgba(2,3,7,.88);border-radius:12px;padding:20px}.overlay h1{font-size:24px;margin:0 0 10px}.overlay p{font-size:12px;line-height:1.5;color:#aab4be}
+button{min-height:48px;padding:0 18px;border:1px solid #39434e;border-radius:12px;background:#11161d;color:#e7edf2;font:inherit;font-weight:700}
+button:active{transform:scale(.97)}button:disabled{opacity:.55}
+.buttons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.diag{margin-top:10px;border:1px solid #29303a;border-radius:12px;padding:10px;background:#0a0e13}.diag-title{font-size:11px;color:#8f9aa5;margin-bottom:8px}.readings{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.reading{text-align:center;border:1px solid #29303a;border-radius:8px;padding:8px;font-size:10px;color:#8f9aa5}.reading b{display:block;color:#e7edf2;font-size:17px;margin-top:4px}.status{text-align:center;color:#8f9aa5;font-size:11px;line-height:1.45;margin-top:8px}.help{text-align:center;color:#7f8993;font-size:10px;line-height:1.5;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="hud"><span>SCORE <b id="score">0</b></span><span>BEST <b id="best">0</b></span><span>LEVEL <b id="level">1</b></span></div>
+<div class="screen">
+<canvas id="game" width="480" height="800"></canvas>
+<div class="overlay" id="overlay">
+<div><h1 id="title">SPACE DODGER V1.2</h1><p id="message">First we'll test your iPhone motion sensor.</p><p>Hold your iPhone normally and tap below.</p><button id="enable">ENABLE MOTION SENSOR</button></div>
+</div>
+</div>
+<div class="buttons"><button id="calibrate">CALIBRATE TILT</button><button id="play">START GAME</button></div>
+<div class="diag"><div class="diag-title">LIVE SENSOR DIAGNOSTICS</div><div class="readings">
+<div class="reading">GAMMA<b id="gx">--</b></div><div class="reading">BETA<b id="gy">--</b></div><div class="reading">MOTION<b id="motion">NO</b></div>
+</div><div class="status" id="status">Sensor has not been enabled.</div></div>
+<div class="help">Open this page directly in Safari. Tap ENABLE, allow motion access, tilt left/right and confirm GAMMA changes. Then CALIBRATE and START GAME.</div>
+</div>
+<script>
+(()=>{"use strict";
+const c=document.getElementById("game"),ctx=c.getContext("2d"),W=480,H=800;
+const scoreEl=document.getElementById("score"),bestEl=document.getElementById("best"),levelEl=document.getElementById("level");
+const overlay=document.getElementById("overlay"),title=document.getElementById("title"),message=document.getElementById("message");
+const enable=document.getElementById("enable"),calibrate=document.getElementById("calibrate"),play=document.getElementById("play");
+const gx=document.getElementById("gx"),gy=document.getElementById("gy"),motion=document.getElementById("motion"),status=document.getElementById("status");
+let best=Number(localStorage.getItem("spaceDodgerBest")||0),running=false,raf=0,last=0;
+let motionEnabled=false,motionSeen=false,permissionBusy=false,gamma=0,beta=0,neutral=0,calibrated=false;
+let score=0,level=1,timeAlive=0,spawnTimer=0,stars=[],rocks=[],particles=[];
+let player={x:W/2,y:H-75,speed:390,inv:0},keys={left:false,right:false},drag=false;
+bestEl.textContent=best;
+
+function initStars(){stars=Array.from({length:85},()=>({x:Math.random()*W,y:Math.random()*H,r:.5+Math.random()*1.7,v:25+Math.random()*70}))}
+function hud(){scoreEl.textContent=Math.floor(score);bestEl.textContent=best;levelEl.textContent=level}
+function reset(){score=0;level=1;timeAlive=0;spawnTimer=0;rocks=[];particles=[];player.x=W/2;player.inv=1.5;initStars();hud()}
+function onOrientation(e){
+ if(typeof e.gamma==="number"&&Number.isFinite(e.gamma)){gamma=e.gamma;gx.textContent=gamma.toFixed(1)+"°";motionSeen=true;motion.textContent="YES";status.textContent="Motion sensor is sending orientation data."}
+ if(typeof e.beta==="number"&&Number.isFinite(e.beta))gy.textContent=e.beta.toFixed(1)+"°";
+}
+async function enableMotion(){
+ if(permissionBusy)return;permissionBusy=true;status.textContent="Requesting motion permission…";
+ try{
+  if(typeof DeviceOrientationEvent==="undefined"){status.textContent="Device orientation is unavailable.";permissionBusy=false;return}
+  if(typeof DeviceOrientationEvent.requestPermission==="function"){
+   const result=await DeviceOrientationEvent.requestPermission();
+   if(result!=="granted"){status.textContent="Permission denied. Touch controls still work.";permissionBusy=false;return}
+  }
+  window.addEventListener("deviceorientation",onOrientation,true);motionEnabled=true;
+  enable.textContent="MOTION ENABLED";enable.disabled=true;
+  status.textContent="Permission granted. Waiting for sensor readings…";
+  setTimeout(()=>{if(!motionSeen)status.textContent="No orientation events received. Open this page directly in Safari."},1800);
+ }catch(e){status.textContent="Motion permission failed. Touch controls still work."}
+ permissionBusy=false;
+}
+function calibrateTilt(){
+ if(!motionSeen){status.textContent="No sensor data yet — enable motion first.";return}
+ neutral=gamma;calibrated=true;status.textContent="Tilt calibrated. Neutral = "+neutral.toFixed(1)+"°";
+}
+function spawn(){const r=16+Math.random()*22+Math.min(14,level*1.1);rocks.push({x:r+Math.random()*(W-r*2),y:-r-10,r,v:115+level*13+Math.random()*70,rot:Math.random()*6.28,spin:(Math.random()-.5)*3})}
+function explosion(x,y){for(let i=0;i<18;i++){const a=Math.random()*6.283,v=45+Math.random()*150;particles.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,life:.5+Math.random()*.5,r:1+Math.random()*3})}}
+function update(dt){
+ timeAlive+=dt;score+=dt*10;level=1+Math.floor(timeAlive/12);if(player.inv>0)player.inv-=dt;
+ let dir=0;if(keys.left)dir--;if(keys.right)dir++;
+ if(motionEnabled&&motionSeen&&calibrated){const d=gamma-neutral,dead=3.5;if(Math.abs(d)>dead)dir=Math.sign(d)*Math.min(1,(Math.abs(d)-dead)/24)}
+ player.x+=dir*player.speed*dt;player.x=Math.max(20,Math.min(W-20,player.x));
+ for(const s of stars){s.y+=s.v*dt*(1+level*.025);if(s.y>H){s.y=0;s.x=Math.random()*W}}
+ spawnTimer+=dt;const interval=Math.max(.2,.82-level*.035);if(spawnTimer>interval){spawnTimer=0;spawn()}
+ for(let i=rocks.length-1;i>=0;i--){const r=rocks[i];r.y+=r.v*dt;r.rot+=r.spin*dt;if(r.y>H+r.r){rocks.splice(i,1);continue}
+  if(player.inv<=0&&Math.hypot(player.x-r.x,player.y-r.y)<r.r+15){explosion(player.x,player.y);player.inv=1.25;score=Math.max(0,score-25);rocks.splice(i,1)}
+ }
+ for(let i=particles.length-1;i>=0;i--){const p=particles[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=70*dt;p.life-=dt;if(p.life<=0)particles.splice(i,1)}
+ if(score>best){best=Math.floor(score);try{localStorage.setItem("spaceDodgerBest",best)}catch(e){}}
+ hud();
+}
+function draw(){
+ ctx.fillStyle="#020307";ctx.fillRect(0,0,W,H);
+ for(const s of stars){ctx.fillStyle=s.r>1.5?"#dce2e7":"#727d88";ctx.fillRect(s.x,s.y,s.r,s.r)}
+ for(const r of rocks){ctx.save();ctx.translate(r.x,r.y);ctx.rotate(r.rot);ctx.beginPath();for(let i=0;i<8;i++){const a=i*Math.PI/4,rr=r.r*(.78+((i*37)%17)/30),x=Math.cos(a)*rr,y=Math.sin(a)*rr;i?ctx.lineTo(x,y):ctx.moveTo(x,y)}ctx.closePath();ctx.fillStyle="#626d78";ctx.fill();ctx.strokeStyle="#c2cad1";ctx.stroke();ctx.restore()}
+ for(const p of particles){ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle="#d9e0e6";ctx.fillRect(p.x-p.r/2,p.y-p.r/2,p.r,p.r)}ctx.globalAlpha=1;
+ if(!running||player.inv<=0||Math.floor(player.inv*10)%2===0){ctx.fillStyle="#e7edf2";ctx.beginPath();ctx.moveTo(player.x,player.y-21);ctx.lineTo(player.x-18,player.y+17);ctx.lineTo(player.x-7,player.y+12);ctx.lineTo(player.x,player.y+20);ctx.lineTo(player.x+7,player.y+12);ctx.lineTo(player.x+18,player.y+17);ctx.closePath();ctx.fill();ctx.fillStyle="#65717c";ctx.fillRect(player.x-5,player.y-6,10,11)}
+}
+function loop(t){if(!running)return;const dt=Math.min(.033,(t-last)/1000);last=t;update(dt);draw();raf=requestAnimationFrame(loop)}
+function startGame(){reset();running=true;overlay.style.display="none";last=performance.now();cancelAnimationFrame(raf);raf=requestAnimationFrame(loop)}
+function moveTouch(e){const r=c.getBoundingClientRect();player.x=Math.max(20,Math.min(W-20,(e.clientX-r.left)/r.width*W))}
+c.addEventListener("pointerdown",e=>{if(!running)return;drag=true;moveTouch(e);c.setPointerCapture?.(e.pointerId)});
+c.addEventListener("pointermove",e=>{if(drag)moveTouch(e)});c.addEventListener("pointerup",()=>drag=false);c.addEventListener("pointercancel",()=>drag=false);
+function hold(id,key){const b=document.getElementById(id);b.addEventListener("pointerdown",e=>{e.preventDefault();keys[key]=true});["pointerup","pointercancel","pointerleave"].forEach(ev=>b.addEventListener(ev,()=>keys[key]=false))}
+enable.addEventListener("click",enableMotion);calibrate.addEventListener("click",calibrateTilt);play.addEventListener("click",startGame);
+hold("calibrate","left"); /* overwritten below: calibration button is not a movement button */
+document.getElementById("calibrate").removeEventListener("pointerdown",()=>{});
+document.addEventListener("keydown",e=>{if(e.key==="ArrowLeft"||e.key.toLowerCase()==="a")keys.left=true;if(e.key==="ArrowRight"||e.key.toLowerCase()==="d")keys.right=true});
+document.addEventListener("keyup",e=>{if(e.key==="ArrowLeft"||e.key.toLowerCase()==="a")keys.left=false;if(e.key==="ArrowRight"||e.key.toLowerCase()==="d")keys.right=false});
+initStars();hud();draw();
+})();
+</script>
+</body>
+</html>
