@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Dharma: Yamaloka — Isometric Action RPG</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#07131a;font-family:Georgia,"Times New Roman",serif;color:#f4e8c5}
+body{touch-action:none}
+canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+#touch{position:fixed;inset:0;pointer-events:none}
+.stick{position:absolute;width:150px;height:150px;border:2px solid #ffffff22;border-radius:50%;background:#07131a55;pointer-events:auto;display:none}
+#joy{left:25px;bottom:25px}
+#knob{position:absolute;width:62px;height:62px;border-radius:50%;left:44px;top:44px;background:#d8d5d0bb;border:2px solid #ffffff55}
+.btn{position:absolute;width:82px;height:82px;border-radius:50%;border:2px solid #f4d28a66;background:#10161acc;box-shadow:0 0 20px #0008;color:#f6d58b;font-weight:bold;font-size:13px;pointer-events:auto;display:none}
+#atk{right:28px;bottom:42px}
+#dash{right:125px;bottom:122px;width:70px;height:70px}
+#special{right:28px;bottom:145px;width:70px;height:70px}
+@media(max-width:900px),(pointer:coarse){.stick,.btn{display:block}}
+#help{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);padding:7px 13px;background:#07131acc;border:1px solid #ffffff18;border-radius:20px;font:12px Arial;color:#c9d0cc;pointer-events:none}
+@media(max-width:700px){#help{display:none}}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="touch">
+  <div class="stick" id="joy"><div id="knob"></div></div>
+  <button class="btn" id="atk">ATTACK</button>
+  <button class="btn" id="dash">DASH</button>
+  <button class="btn" id="special">ASTRA</button>
+</div>
+<div id="help">WASD / Arrows: Move · Space/J: Attack · Shift/K: Dash · Q/L: Astra · R: Restart</div>
+
+<script>
+"use strict";
+
+/* =========================================================
+   DHARMA: YAMALOKA
+   Single-file HTML5 Canvas action roguelike prototype.
+   No external libraries or assets required.
+   ========================================================= */
+
+const canvas=document.getElementById("game"),ctx=canvas.getContext("2d");
+let W=innerWidth,H=innerHeight,DPR=Math.min(devicePixelRatio||1,2);
+function resize(){
+  W=innerWidth;H=innerHeight;DPR=Math.min(devicePixelRatio||1,2);
+  canvas.width=W*DPR;canvas.height=H*DPR;
+  canvas.style.width=W+"px";canvas.style.height=H+"px";
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener("resize",resize);resize();
+
+const TAU=Math.PI*2, clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const rand=(a,b)=>a+Math.random()*(b-a);
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const lerp=(a,b,t)=>a+(b-a)*t;
+
+let keys={},mouse={x:W/2,y:H/2,down:false};
+addEventListener("keydown",e=>{
+  keys[e.key.toLowerCase()]=true;
+  if([" ","arrowup","arrowdown","arrowleft","arrowright"].includes(e.key.toLowerCase()))e.preventDefault();
+  if(e.key.toLowerCase()==="r" && game.over) reset();
+});
+addEventListener("keyup",e=>keys[e.key.toLowerCase()]=false);
+canvas.addEventListener("mousemove",e=>{mouse.x=e.clientX;mouse.y=e.clientY});
+canvas.addEventListener("mousedown",e=>{mouse.down=true});
+addEventListener("mouseup",e=>{mouse.down=false});
+canvas.addEventListener("contextmenu",e=>e.preventDefault());
+
+const joy=document.getElementById("joy"),knob=document.getElementById("knob");
+let joyVec={x:0,y:0},joyActive=false;
+function joySet(e){
+  const r=joy.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2;
+  let x=e.clientX-cx,y=e.clientY-cy,m=Math.hypot(x,y),max=54;
+  if(m>max){x=x/m*max;y=y/m*max}
+  joyVec.x=x/max;joyVec.y=y/max;
+  knob.style.transform=`translate(${x}px,${y}px)`;
+}
+joy.addEventListener("pointerdown",e=>{joyActive=true;joy.setPointerCapture(e.pointerId);joySet(e)});
+joy.addEventListener("pointermove",e=>{if(joyActive)joySet(e)});
+joy.addEventListener("pointerup",e=>{joyActive=false;joyVec.x=joyVec.y=0;knob.style.transform="translate(0,0)"});
+joy.addEventListener("pointercancel",()=>{joyActive=false;joyVec.x=joyVec.y=0;knob.style.transform="translate(0,0)"});
+
+function tapButton(id,fn){
+  const b=document.getElementById(id);
+  b.addEventListener("pointerdown",e=>{e.preventDefault();fn()});
+}
+tapButton("atk",()=>attack());
+tapButton("dash",()=>dash());
+tapButton("special",()=>astra());
+
+const iso={
+  sx:1.05, sy:.52,
+  ox:W/2, oy:H*.48
+};
+function screen(x,y,z=0){
+  return {x:iso.ox+(x-y)*iso.sx,y:iso.oy+(x+y)*iso.sy-z};
+}
+function worldFromScreen(sx,sy){
+  let a=(sx-iso.ox)/iso.sx,b=(sy-iso.oy)/iso.sy;
+  return {x:(a+b)/2,y:(b-a)/2};
+}
+
+let game,player,enemies,projectiles,particles,loot,damageTexts,slashes,decor;
+
+function makePlayer(){
+ return {
+  x:0,y:0,z:0,r:20,hp:120,maxHp:120,mana:60,maxMana:60,
+  speed:190,damage:24,attackRange:105,attackCd:0,combo:0,comboTimer:0,
+  dashCd:0,dashTime:0,invuln:0,astraCd:0,level:1,xp:0,nextXp:80,
+  gold:0,keys:1,crystals:3,face:0
+ };
+}
+
+function reset(){
+ game={time:0,wave:0,waveDelay:2.0,spawnLeft:0,spawnTimer:0,
+       state:"start",over:false,won:false,upgradeOpen:false,
+       message:"",messageTimer:0,shake:0};
+ player=makePlayer();enemies=[];projectiles=[];particles=[];loot=[];damageTexts=[];slashes=[];
+ buildDecor();
+}
+reset();
+
+function buildDecor(){
+ decor=[];
+ // pillars, statues, plants and lamps are generated deterministically enough for the arena
+ for(let i=0;i<42;i++){
+   let x=rand(-560,560),y=rand(-360,360);
+   if(Math.hypot(x,y)<150)continue;
+   decor.push({type:Math.random()<.55?"plant":"pillar",x,y,s:rand(.7,1.35),phase:rand(0,TAU)});
+ }
+ for(let i=0;i<12;i++){
+   let ang=i/12*TAU,r=rand(380,600);
+   decor.push({type:"lamp",x:Math.cos(ang)*r,y:Math.sin(ang)*r,s:1});
+ }
+}
+
+function startGame(){if(game.state==="start"){game.state="play";startWave()}}
+
+function startWave(){
+ game.wave++;
+ const count=5+game.wave*3;
+ game.spawnLeft=count;
+ game.spawnTimer=.1;
+ game.message=game.wave===5?"THE GATE OPENS...":"WAVE "+game.wave;
+ game.messageTimer=2.2;
+ if(game.wave===5) game.bossSpawned=false;
+}
+
+function enemyType(){
+ const r=Math.random();
+ if(game.wave>=3 && r<.18)return"brute";
+ if(game.wave>=2 && r<.38)return"archer";
+ return"ghoul";
+}
+
+function spawnEnemy(type=enemyType(),boss=false){
+ let ang=rand(0,TAU),rr=rand(480,650);
+ let e={
+   type,boss,x:player.x+Math.cos(ang)*rr,y:player.y+Math.sin(ang)*rr,
+   r:boss?38:type==="brute"?29:type==="archer"?20:18,
+   hp:boss?650:type==="brute"?120:type==="archer"?65:50,
+   maxHp:boss?650:type==="brute"?120:type==="archer"?65:50,
+   speed:boss?55:type==="brute"?70:type==="archer"?85:105,
+   damage:boss?28:type==="brute"?18:type==="archer"?12:10,
+   attackCd:rand(.2,1),hit:0,stun:0,phase:rand(0,TAU),
+   rangedCd:rand(1,2),dead:false
+ };
+ enemies.push(e);
+ return e;
+}
+
+function hurtEnemy(e,dmg,knock=0){
+ if(e.dead)return;
+ e.hp-=dmg;e.hit=.13;e.stun=.07;
+ if(knock){
+   const dx=e.x-player.x,dy=e.y-player.y,m=Math.hypot(dx,dy)||1;
+   e.x+=dx/m*knock;e.y+=dy/m*knock;
+ }
+ damageTexts.push({x:e.x,y:e.y-28,text:"-"+Math.round(dmg),life:.65,vy:-38});
+ if(e.hp<=0)killEnemy(e);
+}
+
+function killEnemy(e){
+ if(e.dead)return;
+ e.dead=true;
+ for(let i=0;i<12;i++)particles.push({
+  x:e.x,y:e.y,z:rand(5,32),vx:rand(-80,80),vy:rand(-80,80),vz:rand(20,100),
+  life:rand(.35,.8),max:.8,type:"blood"
+ });
+ if(e.boss){
+   game.won=true;game.over=true;game.state="win";
+   game.message="YAMARA FALLS";
+   return;
+ }
+ const xp=e.type==="brute"?32:e.type==="archer"?22:15;
+ gainXp(xp);
+ if(Math.random()<.55)loot.push({x:e.x+rand(-12,12),y:e.y+rand(-12,12),type:"xp",v:rand(6,14),life:12});
+ if(Math.random()<.16)loot.push({x:e.x,y:e.y,type:"gold",v:rand(8,20),life:12});
+}
+
+function gainXp(v){
+ player.xp+=v;
+ while(player.xp>=player.nextXp){
+   player.xp-=player.nextXp;player.level++;
+   player.nextXp=Math.floor(player.nextXp*1.28+25);
+   game.upgradeOpen=true;
+   player.hp=Math.min(player.maxHp,player.hp+25);
+   player.mana=player.maxMana;
+   game.message="LEVEL UP";
+   game.messageTimer=1.5;
+ }
+}
+
+const upgrades=[
+ ["Vajra Edge","+7 attack damage",()=>player.damage+=7],
+ ["Swift Feet","+18 movement speed",()=>player.speed+=18],
+ ["Iron Will","+30 maximum health",()=>{player.maxHp+=30;player.hp+=30}],
+ ["Blood Rhythm","Attack cooldown -18%",()=>player.attackCd=Math.max(0,player.attackCd-.12)],
+ ["Astra Core","Astra cooldown -25%",()=>player.astraCd=Math.max(0,player.astraCd-.7)],
+ ["Long Reach","+18 attack range",()=>player.attackRange+=18]
+];
+let choices=[];
+function openUpgrades(){
+ choices=[...upgrades].sort(()=>Math.random()-.5).slice(0,3);
+}
+function chooseUpgrade(i){
+ if(!game.upgradeOpen)return;
+ choices[i][2]();game.upgradeOpen=false;
+ game.message=choices[i][0];
+ game.messageTimer=1.4;
+}
+
+function nearestEnemy(range=Infinity){
+ let best=null,bd=range;
+ for(const e of enemies)if(!e.dead){
+   const d=dist(player,e);
+   if(d<bd){bd=d;best=e}
+ }
+ return best;
+}
+
+function attack(){
+ if(game.over||game.upgradeOpen||game.state!=="play"||player.attackCd>0)return;
+ let target=nearestEnemy(player.attackRange+45);
+ let ang=target?Math.atan2(target.y-player.y,target.x-player.x):player.face;
+ player.face=ang;
+ player.combo=player.comboTimer>0?Math.min(3,player.combo+1):1;
+ player.comboTimer=.55;
+ player.attackCd=Math.max(.16,.38-player.combo*.035);
+ slashes.push({x:player.x,y:player.y,ang,life:.24,max:.24,combo:player.combo});
+ for(let i=0;i<enemies.length;i++){
+   const e=enemies[i]; if(e.dead)continue;
+   const dx=e.x-player.x,dy=e.y-player.y,d=Math.hypot(dx,dy);
+   if(d<=player.attackRange+e.r){
+     let da=Math.atan2(dy,dx)-ang;da=Math.atan2(Math.sin(da),Math.cos(da));
+     if(Math.abs(da)<1.0){
+       hurtEnemy(e,player.damage*(1+.18*(player.combo-1)),25+player.combo*8);
+     }
+   }
+ }
+ for(let i=0;i<7;i++)particles.push({
+  x:player.x+Math.cos(ang)*35,y:player.y+Math.sin(ang)*35,z:20+rand(0,25),
+  vx:Math.cos(ang+rand(-.8,.8))*rand(30,130),vy:Math.sin(ang+rand(-.8,.8))*rand(30,130),
+  vz:rand(10,70),life:.22,max:.22,type:"spark"
+ });
+}
+
+function dash(){
+ if(game.over||game.upgradeOpen||player.dashCd>0)return;
+ let dx=0,dy=0;
+ if(keys["a"]||keys["arrowleft"])dx-=1;
+ if(keys["d"]||keys["arrowright"])dx+=1;
+ if(keys["w"]||keys["arrowup"])dy-=1;
+ if(keys["s"]||keys["arrowdown"])dy+=1;
+ if(Math.hypot(dx,dy)<.1){dx=Math.cos(player.face);dy=Math.sin(player.face)}
+ const m=Math.hypot(dx,dy);dx/=m;dy/=m;
+ player.dashTime=.22;player.dashCd=1.05;player.invuln=.3;
+ player.dashVX=dx;player.dashVY=dy;
+ for(let i=0;i<14;i++)particles.push({x:player.x,y:player.y,z:rand(0,35),
+  vx:rand(-50,50),vy:rand(-50,50),vz:rand(10,60),life:.45,max:.45,type:"dash"});
+}
+
+function astra(){
+ if(game.over||game.upgradeOpen||player.astraCd>0||player.mana<30)return;
+ player.mana-=30;player.astraCd=3.5;
+ const N=12;
+ for(let i=0;i<N;i++){
+   const a=i/N*TAU;
+   projectiles.push({x:player.x,y:player.y,vx:Math.cos(a)*390,vy:Math.sin(a)*390,
+                    life:1.2,damage:34,r:6,astra:true});
+ }
+ for(let i=0;i<30;i++)particles.push({x:player.x,y:player.y,z:rand(0,50),
+   vx:rand(-120,120),vy:rand(-120,120),vz:rand(30,150),life:.7,max:.7,type:"magic"});
+}
+
+function update(dt){
+ if(game.state==="start")return;
+ if(game.over)return;
+ if(game.upgradeOpen){
+   if(keys["1"]){keys["1"]=false;chooseUpgrade(0)}
+   if(keys["2"]){keys["2"]=false;chooseUpgrade(1)}
+   if(keys["3"]){keys["3"]=false;chooseUpgrade(2)}
+   return;
+ }
+ game.time+=dt;
+ game.shake=Math.max(0,game.shake-dt*25);
+ player.attackCd=Math.max(0,player.attackCd-dt);
+ player.dashCd=Math.max(0,player.dashCd-dt);
+ player.astraCd=Math.max(0,player.astraCd-dt);
+ player.invuln=Math.max(0,player.invuln-dt);
+ player.comboTimer=Math.max(0,player.comboTimer-dt);
+ player.mana=Math.min(player.maxMana,player.mana+dt*6);
+
+ let mx=(keys["d"]||keys["arrowright"]?1:0)-(keys["a"]||keys["arrowleft"]?1:0)+joyVec.x;
+ let my=(keys["s"]||keys["arrowdown"]?1:0)-(keys["w"]||keys["arrowup"]?1:0)+joyVec.y;
+ if(Math.hypot(mx,my)>1){let m=Math.hypot(mx,my);mx/=m;my/=m}
+ if(mx||my)player.face=Math.atan2(my,mx);
+
+ if((keys[" "]||keys["j"]||mouse.down))attack();
+ if(keys["shift"]||keys["k"]){keys["shift"]=keys["k"]=false;dash()}
+ if(keys["q"]||keys["l"]){keys["q"]=keys["l"]=false;astra()}
+
+ if(player.dashTime>0){
+   player.dashTime-=dt;
+   player.x+=player.dashVX*650*dt;player.y+=player.dashVY*650*dt;
+ }else{
+   player.x+=mx*player.speed*dt;player.y+=my*player.speed*dt;
+ }
+ player.x=clamp(player.x,-650,650);player.y=clamp(player.y,-450,450);
+
+ // wave spawning
+ if(game.spawnLeft>0){
+   game.spawnTimer-=dt;
+   if(game.spawnTimer<=0){
+     spawnEnemy();game.spawnLeft--;game.spawnTimer=.45;
+   }
+ }else if(enemies.filter(e=>!e.dead).length===0){
+   game.waveDelay-=dt;
+   if(game.waveDelay<=0){
+     if(game.wave>=5){
+       if(!game.bossSpawned){game.bossSpawned=true;spawnEnemy("brute",true);game.message="YAMARA • LORD OF THE DEAD";game.messageTimer=3}
+     }else{game.waveDelay=2.5;startWave()}
+   }
+ }else game.waveDelay=2.5;
+
+ // enemies
+ for(const e of enemies){
+   if(e.dead)continue;
+   e.hit=Math.max(0,e.hit-dt);e.stun=Math.max(0,e.stun-dt);
+   const dx=player.x-e.x,dy=player.y-e.y,d=Math.hypot(dx,dy)||1;
+   if(e.type==="archer"&&!e.boss){
+     if(d>260){e.x+=dx/d*e.speed*dt;e.y+=dy/d*e.speed*dt}
+     else if(d<170){e.x-=dx/d*e.speed*dt;e.y-=dy/d*e.speed*dt}
+     e.rangedCd-=dt;
+     if(e.rangedCd<=0&&d<500){
+       e.rangedCd=1.8;
+       projectiles.push({x:e.x,y:e.y,vx:dx/d*240,vy:dy/d*240,life:2,damage:e.damage,r:5,enemy:true});
+     }
+   }else{
+     if(d>e.r+player.r+12 && e.stun<=0){e.x+=dx/d*e.speed*dt;e.y+=dy/d*e.speed*dt}
+     e.attackCd-=dt;
+     if(d<e.r+player.r+15&&e.attackCd<=0){
+       e.attackCd=e.boss?1.0:.95;
+       if(player.invuln<=0){
+         player.hp-=e.damage;game.shake=9;
+         damageTexts.push({x:player.x,y:player.y-35,text:"-"+e.damage,life:.65,vy:-35});
+         if(player.hp<=0){player.hp=0;game.over=true;game.state="lose"}
+       }
+     }
+   }
+ }
+ // projectiles
+ for(const p of projectiles){
+   p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt;
+   if(p.life<=0)continue;
+   if(p.enemy){
+     if(Math.hypot(p.x-player.x,p.y-player.y)<player.r+8){
+       p.life=0;
+       if(player.invuln<=0){player.hp-=p.damage;game.shake=6;
+         damageTexts.push({x:player.x,y:player.y-30,text:"-"+p.damage,life:.6,vy:-30});
+         if(player.hp<=0){player.hp=0;game.over=true;game.state="lose"}
+       }
+     }
+   }else{
+     for(const e of enemies)if(!e.dead&&Math.hypot(p.x-e.x,p.y-e.y)<e.r+8){
+       p.life=0;hurtEnemy(e,p.damage,10);break;
+     }
+   }
+ }
+ projectiles=projectiles.filter(p=>p.life>0);
+ enemies=enemies.filter(e=>!e.dead || e.boss && game.won);
+ // loot
+ for(const l of loot){
+   l.life-=dt;
+   if(dist(player,l)<100){
+     l.life=0;
+     if(l.type==="xp")gainXp(l.v);else player.gold+=Math.round(l.v);
+   }
+ }
+ loot=loot.filter(l=>l.life>0);
+ // particles
+ for(const p of particles){
+   p.life-=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt;p.vz-=220*dt;
+ }
+ particles=particles.filter(p=>p.life>0);
+ for(const t of damageTexts){t.life-=dt;t.y+=t.vy*dt}
+ damageTexts=damageTexts.filter(t=>t.life>0);
+ for(const s of slashes)s.life-=dt;
+ slashes=slashes.filter(s=>s.life>0);
+
+ if(game.messageTimer>0)game.messageTimer-=dt;
+ if(game.upgradeOpen)openUpgrades();
+}
+
+function poly(points,fill,stroke=null,lw=1){
+ ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);
+ for(let i=1;i<points.length;i++)ctx.lineTo(points[i].x,points[i].y);
+ ctx.closePath();if(fill){ctx.fillStyle=fill;ctx.fill()}if(stroke){ctx.lineWidth=lw;ctx.strokeStyle=stroke;ctx.stroke()}
+}
+function ellipse(x,y,rx,ry,fill){
+ ctx.beginPath();ctx.ellipse(x,y,rx,ry,0,0,TAU);ctx.fillStyle=fill;ctx.fill();
+}
+function text(t,x,y,size,fill="#f4e8c5",align="center",weight="normal"){
+ ctx.font=`${weight} ${size}px Georgia`;ctx.textAlign=align;ctx.textBaseline="middle";ctx.fillStyle=fill;ctx.fillText(t,x,y);
+}
+
+function drawBackground(){
+ const g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,"#071a24");g.addColorStop(.55,"#08252b");g.addColorStop(1,"#041116");
+ ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+}
+function drawArena(){
+ const corners=[screen(-700,-480),screen(700,-480),screen(700,480),screen(-700,480)];
+ poly(corners,"#103238","#224d4b",3);
+ // stone tiles
+ for(let x=-650;x<=650;x+=80)for(let y=-430;y<=430;y+=80){
+   const p1=screen(x,y),p2=screen(x+78,y),p3=screen(x+78,y+78),p4=screen(x,y+78);
+   poly([p1,p2,p3,p4],((x/80+y/80)&1)?"#173e42":"#194347","#245052",1);
+ }
+ // cracks
+ ctx.lineWidth=1;ctx.strokeStyle="#08232888";
+ for(let i=0;i<100;i++){
+   let x=Math.floor(rand(-650,650)/80)*80+rand(0,70);
+   let y=Math.floor(rand(-430,430)/80)*80+rand(0,70);
+   let p=screen(x,y);ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(p.x+rand(-15,15),p.y+rand(3,18));ctx.lineTo(p.x+rand(-20,20),p.y+rand(5,30));ctx.stroke();
+ }
+ // central shrine
+ const c=screen(0,0),s=150;
+ poly([screen(-s,0),screen(0,-s),screen(s,0),screen(0,s)],"#21484b","#396565",2);
+ poly([screen(-90,0,8),screen(0,-90,8),screen(90,0,8),screen(0,90,8)],"#0d252b","#55706a",2);
+ ellipse(c.x,c.y-5,65,28,"#09171a");
+ ellipse(c.x,c.y-8,45,20,"#5b2b3a");
+ // gate/altar
+ poly([screen(-50,-70,12),screen(50,-70,12),screen(50,-55,80),screen(-50,-55,80)],"#293b35","#876c45",2);
+ text("☥",c.x,c.y-72,46,"#d4a947");
+}
+
+function drawDecor(){
+ const arr=[...decor].sort((a,b)=>(a.x+a.y)-(b.x+b.y));
+ for(const d of arr){
+   const p=screen(d.x,d.y);
+   if(d.type==="plant"){
+     ellipse(p.x,p.y-5,20*d.s,8*d.s,"#081b20");
+     for(let i=0;i<5;i++){
+       let a=i/5*TAU+d.phase;ellipse(p.x+Math.cos(a)*10*d.s,p.y-10*d.s+Math.sin(a)*6*d.s,9*d.s,15*d.s,"#1d5552");
+     }
+   }else if(d.type==="pillar"){
+     poly([screen(d.x-18,d.y-18),screen(d.x+18,d.y-18),screen(d.x+18,d.y+18),screen(d.x-18,d.y+18)],"#354b44","#65705a",1);
+     poly([screen(d.x-18,d.y-18,0),screen(d.x-18,d.y-18,55*d.s),screen(d.x+18,d.y-18,55*d.s),screen(d.x+18,d.y-18,0)],"#263a37","#5e604e",1);
+     ellipse(p.x,p.y-55*d.s,18*d.s,8*d.s,"#4b5949");
+   }else{
+     ellipse(p.x,p.y-8,17,7,"#06171b");
+     poly([screen(d.x-13,d.y-13),screen(d.x+13,d.y-13),screen(d.x+13,d.y+13),screen(d.x-13,d.y+13)],"#283e3b","#635f49");
+     ellipse(p.x,p.y-28,9,14,"#28a6ad");
+     ctx.shadowBlur=18;ctx.shadowColor="#2ee7ee";ellipse(p.x,p.y-28,4,8,"#8fffff");ctx.shadowBlur=0;
+   }
+ }
+}
+
+function drawEnemy(e){
+ const p=screen(e.x,e.y),bob=Math.sin(game.time*4+e.phase)*2;
+ ellipse(p.x,p.y+7,e.r*1.15,e.r*.5,"#06171b99");
+ let scale=e.boss?1.45:1;
+ ctx.save();ctx.translate(p.x,p.y-bob);
+ // cloak/body
+ if(e.type==="archer"){poly([{x:-14,y:4},{x:0,y:-25*scale},{x:14,y:4},{x:10,y:22},{x:-10,y:22}],"#493148","#171e28",2)}
+ else if(e.type==="brute"){poly([{x:-24,y:16},{x:-19,y:-20},{x:-7,y:-30},{x:8,y:-30},{x:22,y:-14},{x:26,y:17},{x:10,y:29},{x:-14,y:28}],"#39424a","#161d24",3)}
+ else {poly([{x:-15,y:15},{x:-12,y:-20},{x:0,y:-28},{x:13,y:-20},{x:15,y:16},{x:0,y:25}],"#653647","#191d25",2)}
+ // head
+ ellipse(0,-29*scale,11*scale,12*scale,e.boss?"#d0c4a3":"#a9a38f");
+ // horns
+ if(e.type!=="archer"){poly([{x:-9,y:-35},{x:-19,y:-50},{x:-12,y:-32}],"#d5c49c");poly([{x:9,y:-35},{x:19,y:-50},{x:12,y:-32}],"#d5c49c")}
+ // eyes
+ ellipse(-4,-30*scale,2,2,"#e84c3e");ellipse(4,-30*scale,2,2,"#e84c3e");
+ // weapon
+ ctx.strokeStyle="#a89b79";ctx.lineWidth=4;ctx.beginPath();
+ if(e.type==="archer"){ctx.arc(22,0,17,-1.2,1.2);ctx.moveTo(7,-15);ctx.lineTo(7,15)}
+ else {ctx.moveTo(12,-2);ctx.lineTo(31,13)}
+ ctx.stroke();
+ if(e.boss){text("YAMARA",0,-62,12,"#efc86b","center","bold")}
+ ctx.restore();
+ // hp
+ if(e.hp<e.maxHp||e.boss){
+   const bw=e.boss?100:54,bh=6;
+   ctx.fillStyle="#1a1717";ctx.fillRect(p.x-bw/2,p.y-65,bw,bh);
+   ctx.fillStyle=e.boss?"#d34643":"#df403f";ctx.fillRect(p.x-bw/2,p.y-65,bw*clamp(e.hp/e.maxHp,0,1),bh);
+ }
+}
+
+function drawPlayer(){
+ const p=screen(player.x,player.y),bob=Math.sin(game.time*7)*2;
+ ellipse(p.x,p.y+9,24,10,"#06171bcc");
+ ctx.save();ctx.translate(p.x,p.y-bob);
+ // scarf
+ ctx.strokeStyle="#b93e45";ctx.lineWidth=8;ctx.beginPath();ctx.moveTo(-7,-17);ctx.quadraticCurveTo(-30,2,-48,-2);ctx.stroke();
+ // legs
+ ctx.strokeStyle="#d4d1c4";ctx.lineWidth=7;ctx.beginPath();ctx.moveTo(-7,13);ctx.lineTo(-15,29);ctx.moveTo(7,13);ctx.lineTo(17,29);ctx.stroke();
+ // torso
+ poly([{x:-15,y:-18},{x:10,y:-20},{x:16,y:9},{x:0,y:18},{x:-17,y:8}],"#c9a15a","#2a2524",2);
+ // arms
+ ctx.strokeStyle="#b77e56";ctx.lineWidth=7;ctx.beginPath();ctx.moveTo(-11,-11);ctx.lineTo(-27,5);ctx.moveTo(9,-12);ctx.lineTo(25,0);ctx.stroke();
+ // head
+ ellipse(0,-30,12,13,"#b77e56");
+ // hair
+ poly([{x:-12,y:-31},{x:-7,y:-44},{x:5,y:-47},{x:14,y:-37},{x:8,y:-30},{x:0,y:-34},{x:-9,y:-27}],"#1a2027");
+ // sword
+ const a=player.face;
+ ctx.save();ctx.rotate(a);
+ ctx.strokeStyle="#efe4c7";ctx.lineWidth=5;ctx.beginPath();ctx.moveTo(12,1);ctx.lineTo(54,1);ctx.stroke();
+ ctx.strokeStyle="#8d744c";ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(10,-7);ctx.lineTo(10,8);ctx.stroke();
+ ctx.restore();
+ ctx.restore();
+ // dash ring
+ if(player.dashTime>0){ctx.strokeStyle="#8be5ed99";ctx.lineWidth=4;ctx.beginPath();ctx.arc(p.x,p.y,35,0,TAU);ctx.stroke()}
+}
+
+function drawSlash(s){
+ const p=screen(s.x,s.y);
+ const life=s.life/s.max;
+ ctx.save();ctx.translate(p.x,p.y);ctx.rotate(s.ang);
+ ctx.globalAlpha=life;
+ ctx.strokeStyle="#ffe9b2";ctx.lineWidth=7;
+ ctx.beginPath();ctx.arc(0,0,45+s.combo*7,-.95,.7);ctx.stroke();
+ ctx.strokeStyle="#f4b64b";ctx.lineWidth=2;ctx.beginPath();ctx.arc(0,0,50+s.combo*7,-.95,.7);ctx.stroke();
+ ctx.restore();
+}
+
+function drawProjectile(p){
+ const s=screen(p.x,p.y,18),ang=Math.atan2(p.vy,p.vx);
+ ctx.save();ctx.translate(s.x,s.y);ctx.rotate(ang);
+ ctx.shadowBlur=14;ctx.shadowColor=p.enemy?"#ff4545":"#8ffcff";
+ ctx.fillStyle=p.enemy?"#df514d":"#8cefff";ctx.fillRect(-10,-3,20,6);ctx.shadowBlur=0;ctx.restore();
+}
+
+function drawParticles(){
+ for(const p of particles){
+   const s=screen(p.x,p.y,p.z);
+   ctx.globalAlpha=clamp(p.life/p.max,0,1);
+   const r=p.type==="blood"?3:p.type==="magic"?3:2;
+   ctx.fillStyle=p.type==="blood"?"#d95857":p.type==="magic"?"#a7faff":"#ffe5a5";
+   ctx.fillRect(s.x-r,s.y-r,r*2,r*2);
+ }
+ ctx.globalAlpha=1;
+}
+
+function drawLoot(){
+ for(const l of loot){
+   const p=screen(l.x,l.y,15+Math.sin(game.time*5+l.x)*5);
+   ctx.shadowBlur=12;ctx.shadowColor=l.type==="gold"?"#e6ba45":"#8b5cf6";
+   ellipse(p.x,p.y,7,7,l.type==="gold"?"#e5bd45":"#9d63ed");ctx.shadowBlur=0;
+ }
+}
+
+function bar(x,y,w,h,val,max,fill,bg="#151b20cc"){
+ ctx.fillStyle=bg;ctx.fillRect(x,y,w,h);ctx.fillStyle=fill;ctx.fillRect(x,y,w*clamp(val/max,0,1),h);
+ ctx.strokeStyle="#c7b99155";ctx.strokeRect(x,y,w,h);
+}
+
+function drawHUD(){
+ // top-left portrait
+ ctx.fillStyle="#07131acc";ctx.fillRect(16,15,430,104);
+ ctx.strokeStyle="#b99b63";ctx.strokeRect(16,15,430,104);
+ ellipse(62,64,36,36,"#201a22");text("☯",62,64,38,"#e4b75b");
+ bar(105,33,245,16,player.hp,player.maxHp,"#d43e42");
+ text(`${Math.ceil(player.hp)} / ${player.maxHp}`,370,41,14,"#f2e9d0","left","bold");
+ bar(105,57,245,12,player.mana,player.maxMana,"#e8a62e");
+ bar(105,80,245,8,player.xp,player.nextXp,"#8e5ee8");
+ text(`LV ${player.level}`,105,99,13,"#d9c8a3","left","bold");
+ text(`✦ ${player.gold}`,300,101,14,"#e4bd52","left","bold");
+ text(`◆ ${player.crystals}`,370,101,14,"#b77cf1","left","bold");
+ // objective
+ ctx.fillStyle="#07131ad9";ctx.fillRect(W-285,15,269,112);
+ ctx.strokeStyle="#ffffff22";ctx.strokeRect(W-285,15,269,112);
+ text(`WAVE ${Math.min(game.wave,5)} / 5`,W-267,37,17,"#e6bf65","left","bold");
+ const alive=enemies.filter(e=>!e.dead).length;
+ text(game.wave<5?`Defeat all enemies`:(game.won?"The gate is open":"Defeat Yamara"),W-267,63,14,"#e9e1cb","left");
+ text(`Enemies: ${alive}`,W-267,88,13,"#aebbb7","left");
+ // minimap
+ const mw=155,mh=92,mx=W-mw-22,my=140;
+ ctx.fillStyle="#07131ae8";ctx.fillRect(mx,my,mw,mh);ctx.strokeStyle="#a9936a55";ctx.strokeRect(mx,my,mw,mh);
+ for(const e of enemies)if(!e.dead){
+   const ex=mx+mw/2+e.x/1400*mw,ey=my+mh/2+e.y/900*mh;
+   ctx.fillStyle=e.boss?"#ffb84a":"#d84a4a";ctx.fillRect(ex-2,ey-2,4,4);
+ }
+ ctx.fillStyle="#fff1c0";ctx.beginPath();ctx.arc(mx+mw/2+player.x/1400*mw,my+mh/2+player.y/900*mh,4,0,TAU);ctx.fill();
+ // bottom abilities
+ const bx=W-300,by=H-92;
+ ability("Q","ASTRA",bx,by,player.astraCd,3.5);
+ ability("SHIFT","DASH",bx+98,by,player.dashCd,1.05);
+ ability("SPACE","ATTACK",bx+196,by,player.attackCd,.38);
+}
+function ability(key,label,x,y,cd,max){
+ ctx.fillStyle="#0a1419dd";ctx.strokeStyle="#d0aa62aa";ctx.lineWidth=2;
+ ctx.beginPath();ctx.arc(x,y,36,0,TAU);ctx.fill();ctx.stroke();
+ if(cd>0){
+   ctx.fillStyle="#0b111699";ctx.beginPath();ctx.moveTo(x,y);ctx.arc(x,y,34,-Math.PI/2,-Math.PI/2+TAU*(cd/max));ctx.closePath();ctx.fill();
+ }
+ text(key,x,y-3,13,"#f1d48d","center","bold");text(label,x,y+51,11,"#ddd5c1","center","bold");
+}
+
+function drawOverlay(){
+ if(game.state==="start"){
+   ctx.fillStyle="#02090ccc";ctx.fillRect(0,0,W,H);
+   text("DHARMA",W/2,H*.29,58,"#dcb55d","center","bold");
+   text("YAMALOKA",W/2,H*.36,25,"#b9a789","center","bold");
+   text("ISOMETRIC ACTION ROGUELIKE",W/2,H*.415,15,"#c7d0c8");
+   panelButton("ENTER THE REALM",W/2,H*.54,210,52);
+   text("Move • Slash • Dash • Astra • Level Up • Survive 5 waves",W/2,H*.66,14,"#bfc7c2");
+   text("Original prototype inspired by the supplied visual reference.",W/2,H*.71,12,"#82908d");
+ }
+ if(game.upgradeOpen){
+   ctx.fillStyle="#02070bd9";ctx.fillRect(0,0,W,H);
+   text("CHOOSE YOUR BOON",W/2,H*.20,31,"#e3bd69","center","bold");
+   text(`Level ${player.level}`,W/2,H*.25,14,"#b7c3bd");
+   choices.forEach((c,i)=>{
+     const x=W/2+(i-1)*245,y=H*.48;
+     ctx.fillStyle="#101c20f2";ctx.strokeStyle="#a98c5b";
+     ctx.fillRect(x-100,y-82,200,165);ctx.strokeRect(x-100,y-82,200,165);
+     text(`${i+1}`,x,y-58,17,"#e9c46b","center","bold");
+     text(c[0],x,y-18,19,"#f0e6c9","center","bold");
+     text(c[1],x,y+20,13,"#aebbb5");
+     text("Choose",x,y+58,11,"#8c9c96");
+   });
+ }
+ if(game.state==="lose"||game.state==="win"){
+   ctx.fillStyle="#02080bdc";ctx.fillRect(0,0,W,H);
+   text(game.state==="win"?"YAMARA DEFEATED":"YOU HAVE FALLEN",W/2,H*.35,40,game.state==="win"?"#e7c16d":"#d65a55","center","bold");
+   text(game.state==="win"?"The gate to Yamaloka opens.":"The dead claim another warrior.",W/2,H*.43,17,"#d4d0c2");
+   text(`Level ${player.level}  •  Wave ${game.wave}  •  Gold ${player.gold}`,W/2,H*.50,14,"#adb9b4");
+   panelButton("PLAY AGAIN",W/2,H*.62,180,50);
+ }
+ if(game.messageTimer>0 && game.state==="play"&&!game.upgradeOpen){
+   ctx.globalAlpha=clamp(game.messageTimer/.5,0,1);
+   text(game.message,W/2,H*.18,28,"#e7c16d","center","bold");ctx.globalAlpha=1;
+ }
+}
+function panelButton(label,x,y,w,h){
+ ctx.fillStyle="#18272adf";ctx.strokeStyle="#b99250";ctx.lineWidth=2;
+ ctx.fillRect(x-w/2,y-h/2,w,h);ctx.strokeRect(x-w/2,y-h/2,w,h);
+ text(label,x,y,15,"#efd89f","center","bold");
+}
+canvas.addEventListener("click",e=>{
+ if(game.state==="start"){if(e.clientY>H*.49&&e.clientY<H*.59)startGame()}
+ else if(game.state==="lose"||game.state==="win"){if(e.clientY>H*.57&&e.clientY<H*.68)reset(),startGame()}
+ else if(game.upgradeOpen){
+   choices.forEach((c,i)=>{
+     const x=W/2+(i-1)*245,y=H*.48;
+     if(Math.abs(e.clientX-x)<100&&Math.abs(e.clientY-y)<82)chooseUpgrade(i);
+   })
+ }
+});
+
+function render(){
+ drawBackground();
+ const sx=rand(-game.shake,game.shake),sy=rand(-game.shake,game.shake);
+ ctx.save();ctx.translate(sx,sy);
+ drawArena();drawDecor();
+ const sorted=[...enemies.filter(e=>!e.dead)].sort((a,b)=>(a.x+a.y)-(b.x+b.y));
+ for(const e of sorted)drawEnemy(e);
+ drawLoot();
+ for(const p of projectiles)drawProjectile(p);
+ for(const s of slashes)drawSlash(s);
+ drawPlayer();drawParticles();
+ for(const t of damageTexts){const p=screen(t.x,t.y);ctx.globalAlpha=clamp(t.life/.2,0,1);text(t.text,p.x,p.y,14,"#fff1c5","center","bold")}
+ ctx.globalAlpha=1;ctx.restore();
+ drawHUD();drawOverlay();
+}
+
+let last=performance.now();
+function loop(now){
+ let dt=Math.min(.033,(now-last)/1000);last=now;
+ update(dt);render();requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Make keyboard start intuitive.
+addEventListener("keydown",e=>{if(game.state==="start"&&["enter"," "].includes(e.key.toLowerCase()))startGame()});
+</script>
+</body>
+</html>
